@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: $(basename "$0") [-n] <pattern>"
+  echo ""
+  echo "Renames files matching <pattern> by removing their last extension."
+  echo ""
+  echo "Options:"
+  echo "  -n    Dry-run: print what would be renamed without making changes"
+  echo ""
+  echo "Examples:"
+  echo "  $(basename "$0") '*.sh'"
+  echo "  $(basename "$0") -n '*.tar.gz'"
+}
+
+dry_run=false
+
+while getopts ":nh" opt; do
+  case $opt in
+    n) dry_run=true ;;
+    h) usage; exit 0 ;;
+    \?) echo "Unknown option: -$OPTARG" >&2; usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -lt 1 ]]; then
+  echo "Error: missing file pattern" >&2
+  usage >&2
+  exit 1
+fi
+
+matched=0
+
+for file in "$@"; do
+  [[ -e "$file" ]] || continue
+  matched=1
+
+  base="${file%.*}"
+
+  if [[ "$base" == "$file" ]]; then
+    echo "Skipping '$file': no extension to remove"
+    continue
+  fi
+
+  if [[ -e "$base" ]]; then
+    echo "Warning: '$base' already exists, skipping '$file'" >&2
+    continue
+  fi
+
+  if $dry_run; then
+    echo "Would rename: '$file' -> '$base'"
+  else
+    mv -- "$file" "$base"
+    echo "Renamed: '$file' -> '$base'"
+  fi
+done
+
+if [[ $matched -eq 0 ]]; then
+  echo "No files matched" >&2
+  exit 1
+fi

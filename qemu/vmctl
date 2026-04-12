@@ -1,0 +1,1070 @@
+#!/usr/bin/env bash
+# Interactive gum-based wrapper around quickemu.
+# Scans ~/quickemu for VM configs and presents action menus.
+set -euo pipefail
+
+QUICKEMU_DIR="${HOME}/quickemu"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/vmctl"
+QUICKGET_LIST_CACHE="${CACHE_DIR}/quickget-list.csv"
+ISO_CACHE_DIR="${CACHE_DIR}/isos"
+QUICKGET_LIST_CACHE_TTL=604800
+ISO_CACHE_TTL=2592000  # 30 days
+GRAY=$'\033[90m'
+RESET=$'\033[0m'
+
+usage() {
+    cat <<EOF
+Usage: vmctl [-h]
+
+Interactive wrapper around quickemu. Scans ${QUICKEMU_DIR} for VM
+configs and presents gum menus to start, stop, connect, or manage
+snapshots.
+
+Options:
+    -h, --help         Show this help message
+    --clear-cache      Remove the cached quickget OS list
+    --clear-iso-cache  Remove cached ISO files for quickget-created VMs
+
+Dependencies: quickemu, gum, spicy (spice-client-gtk) or remote-viewer
+EOF
+    exit 0
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+menu_header() {
+    local title="$1"
+    local hint="${2:-Esc: Back}"
+    printf '%s\n%s' "$title" "$hint"
+}
+
+prepare_terminal_for_stream_output() {
+    # gum uses a full-screen TUI; reset to a plain terminal before handing off
+    # to long-running commands with their own progress output.
+    printf '\033[0m\033[?25h' >/dev/tty 2>/dev/null || true
+    tput sgr0 >/dev/null 2>&1 || true
+    tput cnorm >/dev/null 2>&1 || true
+    stty sane >/dev/null 2>&1 || true
+}
+
+restore_terminal_for_gum() {
+    # Full terminal reset so gum TUI commands (filter, choose, etc.) work
+    # correctly after streaming output from quickget or similar tools.
+    printf '\033c' >/dev/tty 2>/dev/null || true
+    stty sane >/dev/null 2>&1 || true
+}
+
+cache_key_for() {
+    local os="$1"
+    local release="$2"
+    local edition="${3:-}"
+
+    if [[ -n "$edition" ]]; then
+        printf '%s-%s-%s\n' "$os" "$release" "$edition"
+    else
+        printf '%s-%s\n' "$os" "$release"
+    fi
+}
+
+vm_dir_for() {
+    local cache_key="$1"
+    printf '%s/%s\n' "$QUICKEMU_DIR" "$cache_key"
+}
+
+conf_path_for() {
+    local cache_key="$1"
+    printf '%s/%s.conf\n' "$QUICKEMU_DIR" "$cache_key"
+}
+
+cache_dir_for() {
+    local cache_key="$1"
+    printf '%s/%s\n' "$ISO_CACHE_DIR" "$cache_key"
+}
+
+template_path_for() {
+    local cache_key="$1"
+    printf '%s/template.conf\n' "$(cache_dir_for "$cache_key")"
+}
+
+resolve_quickget_url() {
+    local os="$1"
+    local release="$2"
+    local edition="${3:-}"
+
+    if [[ -n "$edition" ]]; then
+        quickget --url "$os" "$release" "$edition" 2>/dev/null | sed -n '1{s/^[^:]*:[[:space:]]*//;p;}'
+    else
+        quickget --url "$os" "$release" 2>/dev/null | sed -n '1{s/^[^:]*:[[:space:]]*//;p;}'
+    fi
+}
+
+# Given a stale/forbidden ISO URL, try to find a working replacement by reading
+# the SHA256SUMS file at the same base URL. Prints "url hash" on success.
+find_fallback_iso_url() {
+    local stale_url="$1"
+    local base_url iso_filter
+
+    # Extract base URL (everything up to the last /)
+    base_url="${stale_url%/*}"
+    # Build a grep pattern matching the same flavour (desktop/server/etc) and arch
+    iso_filter=$(basename "$stale_url" | grep -oP '(desktop|live-server|server|mini|netboot)[^.]*' || echo "desktop")
+    local arch
+    arch=$(basename "$stale_url" | grep -oP '(amd64|arm64|s390x|ppc64el)' || echo "amd64")
+
+    local sums
+    sums=$(curl -sf --max-time 15 "${base_url}/SHA256SUMS" 2>/dev/null) || return 1
+
+    while IFS= read -r line; do
+        local hash iso
+        hash=$(echo "$line" | awk '{print $1}')
+        iso=$(echo "$line" | awk '{gsub(/^\*/, "", $2); print $2}')
+        [[ -z "$iso" || -z "$hash" ]] && continue
+        local candidate_url="${base_url}/${iso}"
+        [[ "$candidate_url" == "$stale_url" ]] && continue  # skip the known-bad URL
+        local status
+        status=$(curl -sIL --max-time 10 "$candidate_url" 2>/dev/null | awk '/^HTTP/{code=$2} END{print code}')
+        if [[ "$status" == "200" ]]; then
+            echo "$candidate_url $hash"
+            return 0
+        fi
+    done < <(echo "$sums" | grep "$iso_filter" | grep "$arch" | grep "\.iso")
+
+    return 1
+}
+
+# Download an ISO directly (bypassing quickget) and create the .conf file.
+direct_download_vm() {
+    local os="$1"
+    local release="$2"
+    local iso_url="$3"
+    local expected_hash="$4"
+    local disk_size="${5:-32G}"
+
+    local iso_file base_url vm_name vm_dir conf_file
+    iso_file=$(basename "$iso_url")
+    vm_name="${os}-${release}"
+    vm_dir="${QUICKEMU_DIR}/${vm_name}"
+    conf_file="${QUICKEMU_DIR}/${vm_name}.conf"
+
+    mkdir -p "$vm_dir"
+
+    # Reuse existing ISO if it's already present and checksum matches
+    if [[ -f "${vm_dir}/${iso_file}" ]]; then
+        printf 'Verifying existing ISO…\n' >&2
+        local existing_hash
+        existing_hash=$(sha256sum "${vm_dir}/${iso_file}" | awk '{print $1}')
+        if [[ "$existing_hash" == "$expected_hash" ]]; then
+            printf 'Reusing existing %s (checksum OK).\n\n' "$iso_file" >&2
+            echo "$conf_file"
+            return 0
+        fi
+        printf 'Existing ISO checksum mismatch, re-downloading…\n' >&2
+    fi
+
+    printf 'Downloading %s\n' "$iso_file" >&2
+    if ! curl -L --progress-bar -o "${vm_dir}/${iso_file}" "$iso_url"; then
+        printf 'Download failed.\n' >&2
+        return 1
+    fi
+
+    printf 'Verifying checksum…\n' >&2
+    local actual_hash
+    actual_hash=$(sha256sum "${vm_dir}/${iso_file}" | awk '{print $1}')
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+        printf 'Checksum mismatch! Expected: %s\n  Got: %s\n' "$expected_hash" "$actual_hash" >&2
+        rm -f -- "${vm_dir}/${iso_file}"
+        return 1
+    fi
+    printf 'Checksum OK.\n\n' >&2
+
+    if [[ ! -f "$conf_file" ]]; then
+        local quickemu_bin
+        quickemu_bin=$(command -v quickemu || echo "/usr/bin/quickemu")
+        cat > "$conf_file" <<EOF
+#!${quickemu_bin} --vm
+guest_os="linux"
+disk_img="${vm_name}/disk.qcow2"
+disk_size="${disk_size}"
+iso="${vm_name}/${iso_file}"
+EOF
+        chmod u+x "$conf_file"
+    fi
+
+    printf 'Created %s\n' "$conf_file" >&2
+    echo "$conf_file"
+}
+
+link_or_copy_file() {
+    local source_path="$1"
+    local target_path="$2"
+
+    rm -f -- "$target_path"
+    ln -s "$source_path" "$target_path" 2>/dev/null || cp -- "$source_path" "$target_path"
+}
+
+list_conf_iso_paths() {
+    local conf="$1"
+    local vm_dir raw_path resolved_path
+
+    vm_dir=$(dirname "$conf")
+
+    while IFS='=' read -r key raw_path; do
+        raw_path="${raw_path%\"}"
+        raw_path="${raw_path#\"}"
+        [[ -z "$raw_path" ]] && continue
+
+        if [[ "$raw_path" == ~* ]]; then
+            resolved_path="${raw_path/#\~/$HOME}"
+        elif [[ "$raw_path" == /* ]]; then
+            resolved_path="$raw_path"
+        elif [[ -f "${vm_dir}/${raw_path}" ]]; then
+            resolved_path="${vm_dir}/${raw_path}"
+        else
+            resolved_path="${QUICKEMU_DIR}/${raw_path}"
+        fi
+
+        if [[ -f "$resolved_path" && "$resolved_path" == *.iso ]]; then
+            printf '%s\n' "$resolved_path"
+        fi
+    done < <(grep -E '^(iso|fixed_iso)=' "$conf" 2>/dev/null || true)
+}
+
+restore_vm_from_iso_cache() {
+    local cache_key="$1"
+    local cache_dir template_path vm_dir conf_path cached_iso target_iso
+    local -a cached_isos=()
+
+    cache_dir=$(cache_dir_for "$cache_key")
+    template_path=$(template_path_for "$cache_key")
+    vm_dir=$(vm_dir_for "$cache_key")
+    conf_path=$(conf_path_for "$cache_key")
+
+    [[ -f "$template_path" ]] || return 1
+    [[ ! -e "$vm_dir" && ! -e "$conf_path" ]] || return 1
+
+    shopt -s nullglob
+    cached_isos=("${cache_dir}"/*.iso)
+    shopt -u nullglob
+    [[ ${#cached_isos[@]} -gt 0 ]] || return 1
+
+    local now mtime age
+    now=$(date +%s)
+    mtime=$(stat -c %Y "${cached_isos[0]}" 2>/dev/null) || return 1
+    age=$((now - mtime))
+    [[ $age -lt $ISO_CACHE_TTL ]] || return 1
+
+    mkdir -p "$vm_dir"
+    cp -- "$template_path" "$conf_path"
+    chmod u+x "$conf_path"
+
+    for cached_iso in "${cached_isos[@]}"; do
+        target_iso="${vm_dir}/$(basename "$cached_iso")"
+        link_or_copy_file "$cached_iso" "$target_iso"
+    done
+
+    return 0
+}
+
+cache_vm_iso_files() {
+    local conf="$1"
+    local cache_key="$2"
+    local cache_dir template_path iso_path cached_iso
+    local cached_any=0
+
+    cache_dir=$(cache_dir_for "$cache_key")
+    template_path=$(template_path_for "$cache_key")
+
+    mkdir -p "$cache_dir"
+
+    while IFS= read -r iso_path; do
+        [[ -n "$iso_path" ]] || continue
+        cached_iso="${cache_dir}/$(basename "$iso_path")"
+
+        if [[ ! -f "$cached_iso" ]]; then
+            cp -- "$iso_path" "$cached_iso"
+        fi
+
+        link_or_copy_file "$cached_iso" "$iso_path"
+        cached_any=1
+    done < <(list_conf_iso_paths "$conf")
+
+    [[ $cached_any -eq 1 ]] || return 0
+
+    cp -- "$conf" "$template_path"
+    chmod u+x "$template_path"
+}
+
+check_download_url() {
+    local url="$1"
+    [[ -z "$url" ]] && return 0  # no URL to check, let quickget handle it
+    local http_status
+    http_status=$(curl -sIL --max-time 10 "$url" 2>/dev/null | awk '/^HTTP/{code=$2} END{print code}')
+    if [[ "$http_status" == "403" || "$http_status" == "404" ]]; then
+        printf '\nThe download URL for this release returned HTTP %s:\n  %s\n\nquickget may be out of date. Try: sudo apt update && sudo apt upgrade quickemu\n\n' \
+            "$http_status" "$url" >&2
+        return 1
+    fi
+    return 0
+}
+
+run_quickget() {
+    local display_name="$1"
+    local os="$2"
+    local release="$3"
+    local edition="${4:-}"
+    local cache_key
+
+    cache_key=$(cache_key_for "$os" "$release" "$edition")
+
+    prepare_terminal_for_stream_output
+
+    if restore_vm_from_iso_cache "$cache_key"; then
+        printf 'Reusing cached ISO for %s %s' "$display_name" "$release" >&2
+        if [[ -n "$edition" ]]; then
+            printf ' %s' "$edition" >&2
+        fi
+        printf '\n\n' >&2
+        return 0
+    fi
+
+    local quickget_status=0
+    if [[ -n "$edition" ]]; then
+        quickget "$os" "$release" "$edition" || quickget_status=$?
+    else
+        quickget "$os" "$release" || quickget_status=$?
+    fi
+
+    if [[ $quickget_status -ne 0 ]]; then
+        # quickget failed (e.g. checksum mismatch); remove partial files so the
+        # next run triggers a fresh download rather than a broken --continue-at resume.
+        rm -rf -- "$(vm_dir_for "$cache_key")"
+        rm -f -- "$(conf_path_for "$cache_key")"
+        return $quickget_status
+    fi
+
+    printf 'Download complete.\n\n' >&2
+}
+
+clear_cache() {
+    if [[ -f "$QUICKGET_LIST_CACHE" ]]; then
+        rm -f -- "$QUICKGET_LIST_CACHE"
+        echo "Cleared cached quickget OS list: $QUICKGET_LIST_CACHE"
+    else
+        echo "No quickget OS list cache found at: $QUICKGET_LIST_CACHE"
+    fi
+}
+
+clear_iso_cache() {
+    if [[ -d "$ISO_CACHE_DIR" ]]; then
+        rm -rf -- "$ISO_CACHE_DIR"
+        echo "Cleared cached VM ISO files: $ISO_CACHE_DIR"
+    else
+        echo "No cached VM ISO files found at: $ISO_CACHE_DIR"
+    fi
+}
+
+cache_is_fresh() {
+    [[ -f "$QUICKGET_LIST_CACHE" ]] || return 1
+
+    local now cache_mtime age
+    now=$(date +%s)
+    cache_mtime=$(stat -c %Y "$QUICKGET_LIST_CACHE" 2>/dev/null) || return 1
+    age=$((now - cache_mtime))
+    [[ $age -lt $QUICKGET_LIST_CACHE_TTL ]]
+}
+
+get_quickget_csv() {
+    command -v quickget >/dev/null 2>&1 || die "quickget is not installed. Run: sudo apt install quickemu"
+    mkdir -p "$CACHE_DIR"
+
+    if ! cache_is_fresh; then
+        gum spin --title "Fetching available operating systems…" -- \
+            bash -c "quickget --list-csv > \"$QUICKGET_LIST_CACHE\" 2>/dev/null" \
+            || die "'quickget --list-csv' failed. Ensure quickemu is up to date (>= 4.x)."
+    fi
+
+    cat "$QUICKGET_LIST_CACHE"
+}
+
+# Guide the user through quickget to download an OS and create a .conf.
+create_vm() {
+    local csv
+    csv=$(get_quickget_csv)
+    csv=$(echo "$csv" | sed '1d')
+
+    while true; do
+        # Step 1 — pick OS (Esc returns to previous menu)
+        local display_name
+        display_name=$(echo "$csv" | cut -d',' -f1 | sort -u | \
+            gum filter --header "$(menu_header "Select OS to install")" --placeholder "Type to filter…") || return 0
+
+        local os
+        os=$(echo "$csv" | awk -F',' -v display_name="$display_name" '$1==display_name {print $2; exit}')
+        [[ -z "$os" ]] && die "Unable to resolve quickget OS slug for ${display_name}"
+
+        while true; do
+            # Step 2 — pick release (Esc goes back to OS picker)
+            local releases release
+            releases=$(echo "$csv" | awk -F',' -v os="$os" '$2==os {print $3}' | sort -Vu 2>/dev/null || \
+                echo "$csv" | awk -F',' -v os="$os" '$2==os {print $3}' | sort -u)
+            release=$(echo "$releases" | \
+                gum filter --header "$(menu_header "Select release")" --placeholder "Type to filter…") || break
+
+            # Step 3 — pick edition/option (Esc goes back to release picker)
+            local edition=""
+            local -a editions
+            mapfile -t editions < <(echo "$csv" | awk -F',' -v os="$os" -v rel="$release" \
+                '$2==os && $3==rel && $4!="" {print $4}' | sort -u)
+
+            if [[ ${#editions[@]} -gt 1 ]]; then
+                edition=$(printf '%s\n' "${editions[@]}" | \
+                    gum filter --header "$(menu_header "Select edition")" --placeholder "Type to filter…") || continue
+            elif [[ ${#editions[@]} -eq 1 ]]; then
+                edition="${editions[0]}"
+            fi
+
+            # Ask for disk size and confirm before downloading
+            local disk_size
+            disk_size=$(gum input \
+                --header "Disk size for this VM (press Enter for default)" \
+                --placeholder "32G" \
+                --value "32G") || continue
+            [[ -z "$disk_size" ]] && disk_size="32G"
+
+            local spec_msg
+            spec_msg="OS:      ${display_name}"$'\n'"Release: ${release}"
+            [[ -n "$edition" ]] && spec_msg+=$'\n'"Edition: ${edition}"
+            spec_msg+=$'\n'"Disk:    ${disk_size}"
+
+            gum confirm "$(printf 'About to create this VM:\n\n%s\n\nDownload and create?' "$spec_msg")" || continue
+
+            # Validate the download URL before handing off to quickget
+            local dl_url
+            dl_url=$(resolve_quickget_url "$os" "$release" "$edition")
+            if [[ -n "$dl_url" ]]; then
+                local http_status
+                http_status=$(curl -sIL --max-time 10 "$dl_url" 2>/dev/null | awk '/^HTTP/{code=$2} END{print code}')
+                if [[ "$http_status" == "403" || "$http_status" == "404" ]]; then
+                    gum style --foreground 196 "$(printf 'The URL quickget chose is unavailable (HTTP %s):\n  %s' "$http_status" "$dl_url")"
+                    # Try to find a working replacement from the release's SHA256SUMS
+                    local fallback_info fallback_url fallback_hash
+                    fallback_info=$(find_fallback_iso_url "$dl_url" 2>/dev/null || true)
+                    if [[ -n "$fallback_info" ]]; then
+                        fallback_url=$(echo "$fallback_info" | awk '{print $1}')
+                        fallback_hash=$(echo "$fallback_info" | awk '{print $2}')
+                        gum style --foreground 214 "$(printf 'Found a newer version:\n  %s' "$(basename "$fallback_url")")"
+                        if gum confirm "Download this instead?"; then
+                            prepare_terminal_for_stream_output
+                            local new_conf
+                            new_conf=$(direct_download_vm "$os" "$release" "$fallback_url" "$fallback_hash" "$disk_size")
+                            local dl_status=$?
+                            restore_terminal_for_gum
+                            if [[ $dl_status -ne 0 || -z "$new_conf" ]]; then
+                                gum style --foreground 196 "Direct download failed."
+                                continue
+                            fi
+                            gum confirm "VM created. Start it now?" && vm_start "$new_conf"
+                            return 0
+                        fi
+                        continue
+                    else
+                        gum style --foreground 196 "Could not find a working replacement URL. quickget may need to be updated."
+                        action=$(printf 'Pick different OS / release\nCancel' | \
+                            gum choose --header "What would you like to do?") || action="Cancel"
+                        case "$action" in
+                            "Pick different OS / release") break ;;
+                            *) return 0 ;;
+                        esac
+                    fi
+                fi
+            fi
+
+            # Download ISO and create .conf in QUICKEMU_DIR
+            mkdir -p "$QUICKEMU_DIR"
+            pushd "$QUICKEMU_DIR" >/dev/null
+            local qg_status=0
+            run_quickget "$display_name" "$os" "$release" "$edition" || qg_status=$?
+            popd >/dev/null
+
+            if [[ $qg_status -ne 0 ]]; then
+                restore_terminal_for_gum
+                gum style --foreground 196 "Download failed (quickget exited with status ${qg_status})."
+                action=$(printf 'Try again\nPick different OS / release\nCancel' | \
+                    gum choose --header "What would you like to do?") || action="Cancel"
+                case "$action" in
+                    "Try again") continue ;;
+                    "Pick different OS / release") break ;;
+                    *) return 0 ;;
+                esac
+            fi
+
+            # Set disk size in conf
+            local new_conf
+            new_conf=$(pick_conf_for "$os" "$release" "$edition")
+            if [[ -n "$new_conf" ]]; then
+                if grep -q '^disk_size=' "$new_conf"; then
+                    sed -i "s/^disk_size=.*/disk_size=\"${disk_size}\"/" "$new_conf"
+                else
+                    printf 'disk_size="%s"\n' "$disk_size" >> "$new_conf"
+                fi
+
+                cache_vm_iso_files "$new_conf" "$(cache_key_for "$os" "$release" "$edition")"
+            fi
+
+            gum confirm "VM created. Start it now?" && \
+                [[ -n "$new_conf" ]] && vm_start "$new_conf"
+
+            return 0
+        done
+    done
+}
+
+# Find the conf that quickget just created for a given os/release/edition.
+pick_conf_for() {
+    local os="$1" release="$2" edition="${3:-}"
+    local pattern
+    if [[ -n "$edition" ]]; then
+        pattern="${os}-${release}-${edition}.conf"
+    else
+        pattern="${os}-${release}.conf"
+    fi
+    local conf="${QUICKEMU_DIR}/${pattern}"
+    if [[ -f "$conf" ]]; then
+        echo "$conf"
+    else
+        # Fall back: find any conf whose name starts with os-release
+        find "$QUICKEMU_DIR" -maxdepth 2 -name "${os}-${release}*.conf" | head -1
+    fi
+}
+
+# Print the conf path for the VM the user picks, or exit 0 if cancelled.
+# Includes a '+ New VM' option at the top of the list.
+pick_vm() {
+    local -a confs
+    mapfile -t confs < <(find "$QUICKEMU_DIR" -name "*.conf" -type f 2>/dev/null | sort)
+
+    # No VMs yet — go straight to the creation wizard
+    if [[ ${#confs[@]} -eq 0 ]]; then
+        gum confirm "No VMs found in ${QUICKEMU_DIR}. Create one now?" || exit 0
+        create_vm
+        exit 0
+    fi
+
+    local -a names
+    names+=("+ New VM")
+    for conf in "${confs[@]}"; do
+        names+=("$(basename "$conf" .conf)")
+    done
+
+    local selected
+    selected=$(printf '%s\n' "${names[@]}" | gum filter --header "$(menu_header "Select a VM" "Press Esc twice to exit")" --placeholder "Type to filter…") || return 0
+
+    if [[ "$selected" == "+ New VM" ]]; then
+        echo "__CREATE__"
+        return
+    fi
+
+    for conf in "${confs[@]}"; do
+        if [[ "$(basename "$conf" .conf)" == "$selected" ]]; then
+            echo "$conf"
+            return
+        fi
+    done
+}
+
+# Print the path to the VM's disk image.
+find_disk() {
+    local conf="$1"
+    local vmdir
+    vmdir=$(dirname "$conf")
+
+    if [[ -f "${vmdir}/disk.qcow2" ]]; then
+        echo "${vmdir}/disk.qcow2"
+        return 0
+    fi
+    if [[ -f "${vmdir}/disk.img" ]]; then
+        echo "${vmdir}/disk.img"
+        return 0
+    fi
+
+    # Safe grep for explicit disk_img= assignment in the conf
+    local disk_img
+    disk_img=$(grep -m1 '^disk_img=' "$conf" 2>/dev/null | sed 's/^disk_img=//;s/"//g' || true)
+    if [[ -n "$disk_img" ]]; then
+        # Expand leading ~ to HOME for user-relative paths.
+        if [[ "$disk_img" == ~* ]]; then
+            disk_img="${disk_img/#\~/$HOME}"
+        fi
+
+        if [[ "$disk_img" == /* ]]; then
+            if [[ -f "$disk_img" ]]; then
+                echo "$disk_img"
+                return 0
+            fi
+        else
+            # quickemu confs commonly store disk_img as a relative path.
+            if [[ -f "${vmdir}/${disk_img}" ]]; then
+                echo "${vmdir}/${disk_img}"
+                return 0
+            fi
+            if [[ -f "${QUICKEMU_DIR}/${disk_img}" ]]; then
+                echo "${QUICKEMU_DIR}/${disk_img}"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+# Print snapshot metadata as: id|tag|date
+list_snapshots_detailed() {
+    local conf="$1"
+    local disk
+    local info_output
+    local -a rows=()
+    local parsed
+
+    if disk=$(find_disk "$conf" 2>/dev/null); then
+        parsed=$(qemu-img snapshot -l "$disk" 2>/dev/null | awk '
+            $1 ~ /^[0-9]+$/ {
+                line = $0
+                id = $1
+                date = ""
+
+                if (match(line, /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+                    date = substr(line, RSTART, RLENGTH)
+                    prefix = substr(line, 1, RSTART - 1)
+                } else {
+                    prefix = line
+                }
+
+                sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", prefix)
+                sub(/[[:space:]]+[0-9.]+[[:space:]]+[[:alpha:]]+[[:space:]]*$/, "", prefix)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", prefix)
+
+                if (prefix != "") {
+                    print id "|" prefix "|" date
+                }
+            }
+        ')
+        if [[ -n "$parsed" ]]; then
+            mapfile -t rows <<< "$parsed"
+        fi
+    fi
+
+    if [[ ${#rows[@]} -eq 0 ]]; then
+        info_output=$(quickemu --vm "$conf" --snapshot info 2>/dev/null || true)
+        parsed=$(printf '%s\n' "$info_output" | awk '
+            /^Snapshot list:/ { in_list = 1; next }
+            in_list && /^Format specific information:/ { in_list = 0 }
+            !in_list { next }
+
+            $1 ~ /^[0-9]+$/ {
+                line = $0
+                id = $1
+                date = ""
+
+                if (match(line, /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+                    date = substr(line, RSTART, RLENGTH)
+                    prefix = substr(line, 1, RSTART - 1)
+                } else {
+                    prefix = line
+                }
+
+                sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", prefix)
+                sub(/[[:space:]]+[0-9.]+[[:space:]]+[[:alpha:]]+[[:space:]]*$/, "", prefix)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", prefix)
+
+                if (prefix != "") {
+                    print id "|" prefix "|" date
+                }
+            }
+        ')
+        if [[ -n "$parsed" ]]; then
+            mapfile -t rows <<< "$parsed"
+        fi
+    fi
+
+    if [[ ${#rows[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${rows[@]}"
+}
+
+pick_snapshot() {
+    local conf="$1"
+    local vmname
+    local details_output
+    local -a rows
+    local -a labels
+    local -a ids
+    local -a tags
+
+    vmname=$(basename "$conf" .conf)
+
+    if ! details_output=$(list_snapshots_detailed "$conf"); then
+        echo "No snapshots found for ${vmname}" >&2
+        return 1
+    fi
+    mapfile -t rows <<< "$details_output"
+
+    local row id tag date
+    for row in "${rows[@]}"; do
+        IFS='|' read -r id tag date <<< "$row"
+        ids+=("$id")
+        tags+=("$tag")
+        if [[ -n "$date" ]]; then
+            labels+=("ID ${id} | TAG ${tag} | DATE ${date}")
+        else
+            labels+=("ID ${id} | TAG ${tag}")
+        fi
+    done
+
+    local selected
+    selected=$(printf '%s\n' "${labels[@]}" | gum filter --header "$(menu_header "Select a snapshot")" --placeholder "Type to filter…") || return 0
+
+    local i
+    for i in "${!labels[@]}"; do
+        if [[ "${labels[$i]}" == "$selected" ]]; then
+            echo "${ids[$i]}|${tags[$i]}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+snapshot_tag_exists() {
+    local conf="$1"
+    local candidate_tag="$2"
+    local details_output
+    local -a rows
+    local row id tag date
+
+    details_output=$(list_snapshots_detailed "$conf" 2>/dev/null || true)
+    [[ -z "$details_output" ]] && return 1
+
+    mapfile -t rows <<< "$details_output"
+    for row in "${rows[@]}"; do
+        IFS='|' read -r id tag date <<< "$row"
+        if [[ "$tag" == "$candidate_tag" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+snapshot_apply_selected() {
+    local conf="$1"
+    local snapshot_id="$2"
+    local snapshot_tag="$3"
+    local disk
+    local selected_count
+    local tag_count
+
+    disk=$(find_disk "$conf") || die "No disk image found for $(basename "$conf" .conf)"
+
+    selected_count=$(list_snapshots_detailed "$conf" | awk -F'|' -v id="$snapshot_id" -v tag="$snapshot_tag" '$1==id && $2==tag {c++} END{print c+0}')
+    [[ "$selected_count" -eq 1 ]] || die "Selected snapshot no longer exists (ID ${snapshot_id}, TAG ${snapshot_tag})."
+
+    tag_count=$(list_snapshots_detailed "$conf" | awk -F'|' -v tag="$snapshot_tag" '$2==tag {c++} END{print c+0}')
+    [[ "$tag_count" -eq 1 ]] || die "Snapshot tag '${snapshot_tag}' is not unique; cannot safely apply by tag."
+
+    qemu-img snapshot -a "$snapshot_tag" "$disk" || \
+        die "Failed to apply snapshot '${snapshot_tag}'."
+}
+
+snapshot_delete_selected() {
+    local conf="$1"
+    local snapshot_id="$2"
+    local snapshot_tag="$3"
+    local disk
+    local selected_count
+    local tag_count
+
+    disk=$(find_disk "$conf") || die "No disk image found for $(basename "$conf" .conf)"
+
+    selected_count=$(list_snapshots_detailed "$conf" | awk -F'|' -v id="$snapshot_id" -v tag="$snapshot_tag" '$1==id && $2==tag {c++} END{print c+0}')
+    [[ "$selected_count" -eq 1 ]] || die "Selected snapshot no longer exists (ID ${snapshot_id}, TAG ${snapshot_tag})."
+
+    tag_count=$(list_snapshots_detailed "$conf" | awk -F'|' -v tag="$snapshot_tag" '$2==tag {c++} END{print c+0}')
+    [[ "$tag_count" -eq 1 ]] || die "Snapshot tag '${snapshot_tag}' is not unique; cannot safely delete by tag."
+
+    qemu-img snapshot -d "$snapshot_tag" "$disk" || \
+        die "Failed to delete snapshot '${snapshot_tag}'."
+}
+
+vm_info() {
+    local conf="$1"
+    local vmname disk
+    vmname=$(basename "$conf" .conf)
+
+    {
+        printf 'VM: %s\n' "$vmname"
+        printf '%s\n' '=============================='
+
+        printf '\nConfiguration:\n'
+        grep -v '^#' "$conf" 2>/dev/null | while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            printf '  %s\n' "$line"
+        done
+
+        if disk=$(find_disk "$conf" 2>/dev/null); then
+            printf '\nDisk image: %s\n' "$disk"
+            qemu-img info "$disk" 2>/dev/null | grep -E '^(virtual size|disk size|file format):' | while IFS= read -r line; do
+                printf '  %s\n' "$line"
+            done
+        fi
+    } | gum pager
+}
+
+vm_resize_disk() {
+    local conf="$1"
+    local disk current_size
+
+    disk=$(find_disk "$conf") || die "No disk image found for $(basename "$conf" .conf)"
+    current_size=$(qemu-img info "$disk" 2>/dev/null | awk '/^virtual size:/{print $3" "$4}')
+
+    local new_size
+    new_size=$(gum input \
+        --placeholder "e.g. 32G or +10G" \
+        --header "Current virtual size: ${current_size}. Enter new size (Esc: Back)") || return 0
+    [[ -z "$new_size" ]] && return 0
+
+    if [[ "$new_size" != +* && "$new_size" != -* ]]; then
+        if ! qemu-img resize "$disk" "$new_size"; then
+            gum style --foreground 196 "Resize failed. Make sure the new size is larger than the current size."
+        fi
+    else
+        qemu-img resize "$disk" "$new_size" || \
+            gum style --foreground 196 "Resize failed."
+    fi
+}
+
+vm_start() {
+    local conf="$1"
+    local vmdir vmname
+    vmdir=$(dirname "$conf")
+    vmname=$(basename "$conf" .conf)
+
+    local pidfile="${vmdir}/${vmname}.pid"
+    if [[ -f "$pidfile" ]]; then
+        local pid
+        pid=$(cat "$pidfile")
+        kill -0 "$pid" 2>/dev/null && die "${vmname} is already running (PID ${pid})"
+    fi
+
+    quickemu --vm "$conf" --display spice-app
+}
+
+vm_stop() {
+    local conf="$1"
+    quickemu --vm "$conf" --kill
+}
+
+vm_connect() {
+    local conf="$1"
+    local vmdir vmname
+    vmdir=$(dirname "$conf")
+    vmname=$(basename "$conf" .conf)
+
+    local spice_file="${vmdir}/${vmname}.spice"
+    [[ -f "$spice_file" ]] || die "${vmname} is not running (no .spice file found at ${spice_file})"
+
+    local spice_val
+    spice_val=$(cat "$spice_file")
+
+    if command -v spicy &>/dev/null; then
+        if [[ "$spice_val" == /* ]]; then
+            spicy --uri="spice+unix://${spice_val}" &
+        else
+            spicy --port "$spice_val" &
+        fi
+    elif command -v remote-viewer &>/dev/null; then
+        if [[ "$spice_val" == /* ]]; then
+            remote-viewer "spice+unix://${spice_val}" &
+        else
+            remote-viewer "spice://localhost:${spice_val}" &
+        fi
+    else
+        die "No SPICE viewer found. Install spice-client-gtk (spicy) or virt-viewer (remote-viewer)"
+    fi
+}
+
+snapshot_action() {
+    local conf="$1"
+
+    while true; do
+        local action
+        action=$(printf '%s\n' "Create" "Apply" "List" "Delete" | \
+            gum choose --cursor "> " --header "$(menu_header "Snapshot action")") || return 0
+
+        case "$action" in
+            Create)
+                while true; do
+                    local name
+                    name=$(gum input --placeholder "Snapshot name (Esc: Back)") || break
+                    [[ -z "$name" ]] && continue
+
+                    if snapshot_tag_exists "$conf" "$name"; then
+                        gum style --foreground 212 "Snapshot name '${name}' already exists. Choose a unique name."
+                        continue
+                    fi
+
+                    gum confirm "Create snapshot '${name}'?" || continue
+
+                    quickemu --vm "$conf" --snapshot create "$name"
+                    break
+                done
+                ;;
+            Apply)
+                local selected_snapshot snapshot_id snapshot_tag
+                selected_snapshot=$(pick_snapshot "$conf") || continue
+                [[ -z "$selected_snapshot" ]] && continue
+                IFS='|' read -r snapshot_id snapshot_tag <<< "$selected_snapshot"
+                [[ -z "$snapshot_id" || -z "$snapshot_tag" ]] && continue
+                gum confirm "Apply snapshot '${snapshot_tag}'? The VM will be reverted to this state." || continue
+                snapshot_apply_selected "$conf" "$snapshot_id" "$snapshot_tag"
+                ;;
+            List)
+                local details_output
+                if ! details_output=$(list_snapshots_detailed "$conf"); then
+                    printf 'No snapshots found for %s\n' "$(basename "$conf" .conf)" | gum pager
+                    continue
+                fi
+
+                local -a rows
+                mapfile -t rows <<< "$details_output"
+
+                {
+                    printf 'ID | TAG | DATE\n'
+                    printf '%s\n' '------------------------------'
+                    local row id tag date
+                    for row in "${rows[@]}"; do
+                        IFS='|' read -r id tag date <<< "$row"
+                        [[ -z "$date" ]] && date="-"
+                        printf '%s | %s | %s\n' "$id" "$tag" "$date"
+                    done
+                } | gum pager
+                ;;
+            Delete)
+                local selected_snapshot snapshot_id snapshot_tag
+                selected_snapshot=$(pick_snapshot "$conf") || continue
+                [[ -z "$selected_snapshot" ]] && continue
+                IFS='|' read -r snapshot_id snapshot_tag <<< "$selected_snapshot"
+                [[ -z "$snapshot_id" || -z "$snapshot_tag" ]] && continue
+                gum confirm "Permanently delete snapshot '${snapshot_tag}'? This cannot be undone." || continue
+                snapshot_delete_selected "$conf" "$snapshot_id" "$snapshot_tag"
+                ;;
+        esac
+    done
+}
+
+vm_status_summary() {
+    local conf="$1"
+    local vmname vmdir pidfile pid spice_file spice_val
+
+    vmname=$(basename "$conf" .conf)
+    vmdir=$(dirname "$conf")
+    pidfile="${vmdir}/${vmname}.pid"
+    spice_file="${vmdir}/${vmname}.spice"
+
+    if [[ -f "$pidfile" ]]; then
+        pid=$(cat "$pidfile" 2>/dev/null || true)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            printf 'running|%s|' "$pid"
+            if [[ -f "$spice_file" ]]; then
+                spice_val=$(cat "$spice_file" 2>/dev/null || true)
+                printf '%s' "$spice_val"
+            fi
+            printf '\n'
+            return
+        fi
+    fi
+
+    printf 'stopped||\n'
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        --clear-cache)
+            clear_cache
+            exit 0
+            ;;
+        --clear-iso-cache)
+            clear_iso_cache
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+command -v gum      >/dev/null 2>&1 || die "gum is not installed. See https://github.com/charmbracelet/gum"
+command -v quickemu >/dev/null 2>&1 || die "quickemu is not installed. Run: sudo apt install quickemu"
+
+while true; do
+    conf=$(pick_vm)
+    [[ -z "$conf" ]] && exit 0
+
+    # Handle the "create new VM" sentinel returned by pick_vm
+    if [[ "$conf" == "__CREATE__" ]]; then
+        create_vm
+        continue
+    fi
+
+    vmname=$(basename "$conf" .conf)
+
+    while true; do
+        # Reset menu position so follow-up menus don't render at the bottom when
+        # the previous list was long.
+        clear
+
+        status_line=""
+        vm_state=""
+        vm_pid=""
+        vm_spice=""
+        action_header=""
+        available_actions=()
+
+        status_line=$(vm_status_summary "$conf")
+        IFS='|' read -r vm_state vm_pid vm_spice <<< "$status_line"
+
+        action_header=$(printf 'Action for %s\nStatus: ' "$vmname")
+        if [[ "$vm_state" == "running" ]]; then
+            action_header+="Running (PID ${vm_pid})"
+            if [[ -n "$vm_spice" ]]; then
+                action_header+=$'\n'"SPICE: ${vm_spice}"
+            fi
+
+            available_actions=("Stop" "Connect" "Info")
+        else
+            action_header+="Stopped"
+
+            available_actions=("Start" "Snapshots" "Resize Disk" "Info")
+        fi
+
+        action=$(printf '%s\n' "${available_actions[@]}" | \
+            gum choose --cursor "> " --header "$(menu_header "$action_header")") || break
+
+        case "$action" in
+            Start)            vm_start "$conf"; break ;;
+            Stop)             vm_stop "$conf" ;;
+            Connect)          vm_connect "$conf" ;;
+            Info)             vm_info "$conf" ;;
+            Snapshots)        snapshot_action "$conf" ;;
+            "Resize Disk")    vm_resize_disk "$conf" ;;
+        esac
+    done
+done
