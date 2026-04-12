@@ -6,7 +6,7 @@ Shell utility scripts installed to `~/.local/bin` so they're on `$PATH` from any
 
 | Directory | Purpose |
 |-----------|---------|
-| `files/`  | General file/filesystem utilities |
+| `general/` | General file/filesystem utilities |
 | `qemu/`   | `vmctl` — interactive gum wrapper around quickemu |
 
 ## Conventions
