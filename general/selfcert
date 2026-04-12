@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-h] [-d domain] [-o org] [-y days] [-O output_dir] [-p pfx_password] [-s san_list]
+
+Create a local CA and a self-signed leaf certificate bundle for a domain.
+
+Options:
+    -d domain    Domain name for the certificate and output files (default: localhost)
+    -o org       Organization/Common Name for the CA issuer (default: localhost-ca)
+    -y days      Certificate validity in days (default: 365)
+    -O dir       Output directory for generated files (default: current directory)
+    -p password  PKCS#12 export password; if omitted, openssl will prompt
+    -s san_list  Comma-separated DNS subjectAltName entries; domain is always included
+    -h           Show this help message
+
+Outputs:
+    <dir>/ca.key, <dir>/ca.crt, <dir>/ca.srl
+    <dir>/<domain>.key, <dir>/<domain>.csr, <dir>/<domain>.crt, <dir>/<domain>.pfx
+
+Examples:
+    $(basename "$0")
+    $(basename "$0") -d example.local -O certs
+    $(basename "$0") -d example.local -s www.example.local,api.example.local
+    $(basename "$0") -d example.local -o example-ca -y 825 -O certs
+    $(basename "$0") -d example.local -p secret123
+EOF
+}
+
+domain="localhost"
+org="localhost-ca"
+days="365"
+output_dir="."
+pfx_password=""
+san_list=""
+
+while getopts ":d:o:y:O:p:s:h" opt; do
+    case "$opt" in
+        d) domain="$OPTARG" ;;
+        o) org="$OPTARG" ;;
+        y) days="$OPTARG" ;;
+        O) output_dir="$OPTARG" ;;
+        p) pfx_password="$OPTARG" ;;
+        s) san_list="$OPTARG" ;;
+        h)
+            usage
+            exit 0
+            ;;
+        :)
+            echo "Error: option -$OPTARG requires an argument" >&2
+            usage >&2
+            exit 1
+            ;;
+        \?)
+            echo "Error: unknown option -$OPTARG" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+if [[ $# -ne 0 ]]; then
+    echo "Error: unexpected positional arguments" >&2
+    usage >&2
+    exit 1
+fi
+
+command -v openssl >/dev/null 2>&1 || {
+    echo "Error: openssl is required" >&2
+    exit 1
+}
+
+mkdir -p "$output_dir"
+
+ca_key="${output_dir}/ca.key"
+ca_crt="${output_dir}/ca.crt"
+ca_srl="${output_dir}/ca.srl"
+leaf_key="${output_dir}/${domain}.key"
+leaf_csr="${output_dir}/${domain}.csr"
+leaf_crt="${output_dir}/${domain}.crt"
+leaf_pfx="${output_dir}/${domain}.pfx"
+
+subject_alt_name="DNS:${domain}"
+if [[ -n "$san_list" ]]; then
+    IFS=',' read -r -a san_entries <<< "$san_list"
+    for san in "${san_entries[@]}"; do
+        san="${san## }"
+        san="${san%% }"
+        [[ -z "$san" || "$san" == "$domain" ]] && continue
+        subject_alt_name+=",DNS:${san}"
+    done
+fi
+
+openssl genpkey -algorithm RSA -out "$ca_key"
+openssl req -x509 -key "$ca_key" -out "$ca_crt" \
+    -days "$days" \
+    -subj "/CN=${org}/O=${org}"
+
+openssl genpkey -algorithm RSA -out "$leaf_key"
+openssl req -new -key "$leaf_key" -out "$leaf_csr" \
+    -subj "/CN=${domain}/O=${org}"
+
+openssl x509 -req -in "$leaf_csr" -days "$days" -out "$leaf_crt" \
+    -CA "$ca_crt" -CAkey "$ca_key" -CAserial "$ca_srl" -CAcreateserial \
+    -extfile <(cat <<END
+basicConstraints = CA:FALSE
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+subjectAltName = ${subject_alt_name}
+END
+    )
+
+if [[ -n "$pfx_password" ]]; then
+    openssl pkcs12 -export -out "$leaf_pfx" -inkey "$leaf_key" -in "$leaf_crt" \
+        -passout "pass:${pfx_password}"
+else
+    openssl pkcs12 -export -out "$leaf_pfx" -inkey "$leaf_key" -in "$leaf_crt"
+fi

@@ -1,0 +1,16 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^bash -n qemu/vmctl$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^bash -n /home/mark/src/github/mapitman/scripts/qemu/vmctl$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^bash -n /home/mark/src/github/mapitman/scripts/general/selfcert$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
