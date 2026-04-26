@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [-n] [-r framerate] [-o output_dir] <timelapse_dir>
+
+Convert timelapse JPEG sequences into MP4 videos using ffmpeg.
+
+Each subdirectory of <timelapse_dir> is treated as a separate job. JPEGs
+within each job directory (including subdirectories) are sorted by name and
+assembled into a video named after the job.
+
+Options:
+  -r framerate   Frames per second for the output video (default: 24)
+  -o output_dir  Directory to write videos into (default: <timelapse_dir>/../timelapse_videos)
+  -n             Dry run: show what would be processed without creating videos
+  -h             Show this help message
+
+Examples:
+  $(basename "$0") ~/timelapse
+  $(basename "$0") -r 30 ~/timelapse
+  $(basename "$0") -o ~/videos ~/timelapse
+  $(basename "$0") -n ~/timelapse
+EOF
+}
+
+framerate=24
+output_dir=""
+dry_run=false
+
+while getopts ":r:o:nh" opt; do
+  case $opt in
+    r) framerate="$OPTARG" ;;
+    o) output_dir="$OPTARG" ;;
+    n) dry_run=true ;;
+    h) usage; exit 0 ;;
+    :) echo "Error: option -$OPTARG requires an argument" >&2; usage >&2; exit 1 ;;
+    \?) echo "Error: unknown option: -$OPTARG" >&2; usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -ne 1 ]]; then
+  echo "Error: expected exactly one argument (timelapse_dir)" >&2
+  usage >&2
+  exit 1
+fi
+
+timelapse_dir="$(cd -- "$1" && pwd)"
+
+if [[ -z "$output_dir" ]]; then
+  output_dir="$(dirname "$timelapse_dir")/timelapse_videos"
+fi
+
+command -v ffmpeg >/dev/null 2>&1 || {
+  echo "Error: ffmpeg is required" >&2
+  exit 1
+}
+
+if ! $dry_run; then
+  mkdir -p -- "$output_dir"
+fi
+
+for job_dir in "$timelapse_dir"/*/; do
+  [[ -d "$job_dir" ]] || continue
+  job_name="$(basename -- "$job_dir")"
+  output_file="$output_dir/${job_name}.mp4"
+
+  mapfile -t jpegs < <(find "$job_dir" -name "*.jpg" -o -name "*.jpeg" | sort)
+
+  if [[ ${#jpegs[@]} -eq 0 ]]; then
+    echo "Skipping '$job_name': no JPEGs found."
+    continue
+  fi
+
+  echo "Processing '$job_name': ${#jpegs[@]} frames -> $output_file"
+
+  if $dry_run; then
+    continue
+  fi
+
+  tmp_list="$(mktemp /tmp/mktlapse_XXXXXX.txt)"
+  trap 'rm -f "$tmp_list"' EXIT
+
+  for f in "${jpegs[@]}"; do
+    printf "file '%s'\n" "$f" >> "$tmp_list"
+  done
+
+  ffmpeg -y -r "$framerate" -f concat -safe 0 -i "$tmp_list" \
+    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+    -c:v libx264 -pix_fmt yuv420p -crf 23 \
+    "$output_file" \
+    && echo "  -> Done: $output_file" \
+    || echo "  -> Failed: $output_file" >&2
+
+  rm -f -- "$tmp_list"
+  trap - EXIT
+done
+
+echo "All done. Videos in: $output_dir"

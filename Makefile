@@ -8,11 +8,13 @@ MAN1DIR ?= $(MANDIR)/man1
 PANDOC ?= pandoc
 
 SCRIPTS := \
+	general/mktlapse \
 	general/selfcert \
 	general/strip-ext \
 	qemu/vmctl
 
 MAN_SOURCES := \
+	man/mktlapse.1.md \
 	man/selfcert.1.md \
 	man/strip-ext.1.md \
 	man/vmctl.1.md
