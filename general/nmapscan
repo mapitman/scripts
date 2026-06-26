@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [-h] [-o output_dir] [-u] <target>
+
+Run a comprehensive nmap reconnaissance scan against an IP address, hostname,
+or CIDR subnet. Performs host discovery, full TCP port scan, service/version
+and OS detection, UDP scan (requires root), NSE script battery, and a
+traceroute probe.
+
+Options:
+    -o dir  Directory for output files (default: ./nmapscan-results)
+    -u      Skip UDP scan even when running as root
+    -h      Show this help message
+
+Arguments:
+    target  IP address, hostname, or CIDR subnet (e.g. 192.168.1.0/24)
+
+Examples:
+    $(basename "$0") 192.168.1.1
+    $(basename "$0") 192.168.1.0/24
+    $(basename "$0") -o /tmp/scans 10.0.0.0/16
+    $(basename "$0") -u scanme.nmap.org
+EOF
+}
+
+outdir="./nmapscan-results"
+skip_udp=false
+
+while getopts ":o:uh" opt; do
+    case "$opt" in
+        o) outdir="$OPTARG" ;;
+        u) skip_udp=true ;;
+        h) usage; exit 0 ;;
+        :) echo "Error: option -$OPTARG requires an argument" >&2; usage >&2; exit 1 ;;
+        \?) echo "Error: unknown option -$OPTARG" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+if [[ $# -ne 1 ]]; then
+    echo "Error: exactly one target is required" >&2
+    usage >&2
+    exit 1
+fi
+
+TARGET="$1"
+
+command -v nmap >/dev/null 2>&1 || { echo "Error: nmap is required" >&2; exit 1; }
+
+# Several nmap features (ICMP probes, UDP ping, OS detection, raw SYN scans,
+# UDP scan) require reading raw packets off the wire, which needs root. Rather
+# than requiring the whole script to run as root, we prefix nmap with sudo so
+# you keep your normal environment while nmap itself gets the privileges it needs.
+if [[ $EUID -eq 0 ]]; then
+    NMAP="nmap"
+else
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Error: sudo is required to run nmap with the privileges it needs" >&2
+        exit 1
+    fi
+    echo "[!] Some nmap features (ICMP probes, OS detection, raw SYN/UDP scans)"
+    echo "    require root. The script will invoke nmap via sudo where needed."
+    echo "    You may be prompted for your password."
+    echo ""
+    NMAP="sudo nmap"
+fi
+
+mkdir -p "$outdir"
+TS=$(date +%Y%m%d_%H%M%S)
+# Sanitize target for use in filenames (replace dots, slashes, colons)
+SAFE="${TARGET//\//_}"
+SAFE="${SAFE//./_}"
+BASE="${outdir}/${SAFE}_${TS}"
+
+echo "[*] Target:     $TARGET"
+echo "[*] Output dir: $outdir"
+echo ""
+
+# ── 1. Host discovery ─────────────────────────────────────────────────────────
+echo "[1/6] Host discovery..."
+$NMAP -sn \
+    -PE -PP -PM \
+    -PS22,80,443,8080,8443 \
+    -PA80,443 \
+    -PU53,161 \
+    --traceroute \
+    -oN "${BASE}_01_discovery.txt" \
+    -- "$TARGET"
+
+# ── 2. Full TCP port scan ─────────────────────────────────────────────────────
+echo "[2/6] Full TCP port scan (all 65535 ports)..."
+$NMAP -p- -T4 --min-rate 1000 --open \
+    -oN "${BASE}_02_tcp_full.txt" \
+    -- "$TARGET"
+
+OPEN_PORTS=$(grep "^[0-9]" "${BASE}_02_tcp_full.txt" 2>/dev/null \
+    | grep open \
+    | awk -F'/' '{print $1}' \
+    | paste -sd',' || true)
+
+echo "    Open TCP ports: ${OPEN_PORTS:-none found}"
+
+PORT_ARG="${OPEN_PORTS:-1-1000}"
+
+# ── 3. Service & version detection + OS fingerprinting ────────────────────────
+echo "[3/6] Service/version detection and OS fingerprinting..."
+$NMAP -p "$PORT_ARG" \
+    -sV --version-intensity 9 \
+    -O --osscan-guess \
+    -sC \
+    -oN "${BASE}_03_services.txt" \
+    -- "$TARGET"
+
+# ── 4. UDP scan (top 200 common ports) ────────────────────────────────────────
+echo "[4/6] UDP scan (top 200 ports)..."
+if [[ "$skip_udp" == true ]]; then
+    echo "    Skipped (-u flag)"
+else
+    $NMAP -sU --top-ports 200 -T4 --open \
+        -oN "${BASE}_04_udp.txt" \
+        -- "$TARGET"
+fi
+
+# ── 5. NSE script battery ─────────────────────────────────────────────────────
+echo "[5/6] NSE script battery (default, auth, discovery, vuln, malware)..."
+$NMAP -p "$PORT_ARG" \
+    --script "default,auth,discovery,vuln,malware,safe" \
+    --script-timeout 30s \
+    -oN "${BASE}_05_scripts.txt" \
+    -- "$TARGET"
+
+# ── 6. Traceroute + evasion timing probe ─────────────────────────────────────
+echo "[6/6] Traceroute and low-noise timing probe..."
+$NMAP -p "$PORT_ARG" \
+    --traceroute \
+    -sV -T2 \
+    -oN "${BASE}_06_traceroute.txt" \
+    -- "$TARGET"
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "=============================="
+echo " Scan complete — results saved"
+echo "=============================="
+ls -1 "${outdir}/"*"${TS}"* 2>/dev/null
+
+echo ""
+echo "[*] Open services detected:"
+grep "^[0-9].*open" "${BASE}_03_services.txt" 2>/dev/null || echo "  (none detected)"
