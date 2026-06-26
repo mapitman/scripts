@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: $(basename "$0") [-f] [-h] [<dir>]"
+  echo ""
+  echo "Iterates over all Git repositories in a directory and reports which ones"
+  echo "have uncommitted changes or unpushed commits."
+  echo ""
+  echo "Options:"
+  echo "  -f    Fetch from remotes before checking for unpushed commits"
+  echo "  -h    Show this help message and exit"
+  echo ""
+  echo "Examples:"
+  echo "  $(basename "$0")"
+  echo "  $(basename "$0") -f ~/src"
+}
+
+fetch=false
+
+while getopts ":fh" opt; do
+  case $opt in
+    f) fetch=true ;;
+    h) usage; exit 0 ;;
+    \?) echo "Unknown option: -$OPTARG" >&2; usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -gt 1 ]]; then
+  echo "Error: too many arguments" >&2
+  usage >&2
+  exit 1
+fi
+
+# Setup colors and icons if output is a terminal
+if [[ -t 1 ]]; then
+  BOLD="\033[1m"
+  GREEN="\033[32m"
+  YELLOW="\033[33m"
+  RED="\033[31m"
+  BLUE="\033[34m"
+  NC="\033[0m" # No Color
+
+  CLEAN_ICON="✨ "
+  DIRTY_ICON="📦 "
+  UNCOMMITTED_ICON="⚠️  "
+  UNPUSHED_ICON="⬆️  "
+  WARNING_ICON="⚠️  "
+else
+  BOLD=""
+  GREEN=""
+  YELLOW=""
+  RED=""
+  BLUE=""
+  NC=""
+
+  CLEAN_ICON=""
+  DIRTY_ICON=""
+  UNCOMMITTED_ICON=""
+  UNPUSHED_ICON=""
+  WARNING_ICON=""
+fi
+
+target_dir="."
+if [[ $# -eq 1 ]]; then
+  target_dir="$1"
+fi
+
+if [[ ! -d "$target_dir" ]]; then
+  echo "Error: '$target_dir' is not a directory" >&2
+  exit 1
+fi
+
+target_dir=$(realpath -- "$target_dir")
+
+# Find all git repositories (directories containing a .git entry)
+repos=()
+while IFS= read -r -d '' gitdir; do
+  repos+=("$(dirname "$gitdir")")
+done < <(find "$target_dir" -name .git -prune -print0 2>/dev/null | sort -z)
+
+if [[ ${#repos[@]} -eq 0 ]]; then
+  echo "No Git repositories found under '$target_dir'."
+  exit 0
+fi
+
+dirty_count=0
+
+for repo in "${repos[@]}"; do
+  if [[ ! -d "$repo" ]]; then
+    continue
+  fi
+
+  # Double-check that it is a valid git repository
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    continue
+  fi
+
+  # Fetch remotes if requested and if any remotes exist
+  if $fetch; then
+    if git -C "$repo" remote | grep -q .; then
+      git -C "$repo" fetch --all --prune >/dev/null 2>&1 || echo -e "${RED}${WARNING_ICON}Warning: failed to fetch in '$repo'${NC}" >&2
+    fi
+  fi
+
+  dirty=false
+  uncommitted=false
+  status_output=""
+
+  if status_output=$(git -C "$repo" status --porcelain 2>/dev/null); then
+    if [[ -n "$status_output" ]]; then
+      uncommitted=true
+      dirty=true
+    fi
+  fi
+
+  unpushed=false
+  unpushed_commits=""
+
+  # Only check for unpushed commits if at least one remote is configured
+  if git -C "$repo" remote | grep -q .; then
+    if unpushed_commits=$(git -C "$repo" log --branches --not --remotes --oneline 2>/dev/null); then
+      if [[ -n "$unpushed_commits" ]]; then
+        unpushed=true
+        dirty=true
+      fi
+    fi
+  fi
+
+  if $dirty; then
+    dirty_count=$((dirty_count + 1))
+    echo -e "${BOLD}${DIRTY_ICON}${repo}${NC}"
+    if $uncommitted; then
+      echo -e "  ${YELLOW}${UNCOMMITTED_ICON}Uncommitted changes:${NC}"
+      echo "$status_output" | sed 's/^/    /'
+    fi
+    if $unpushed; then
+      echo -e "  ${BLUE}${UNPUSHED_ICON}Unpushed commits:${NC}"
+      echo "$unpushed_commits" | sed 's/^/    /'
+    fi
+    echo ""
+  fi
+done
+
+if [[ $dirty_count -eq 0 ]]; then
+  if [[ ${#repos[@]} -eq 1 ]]; then
+    echo -e "${GREEN}${CLEAN_ICON}The only Git repository under '$target_dir' is clean.${NC}"
+  else
+    echo -e "${GREEN}${CLEAN_ICON}All ${#repos[@]} Git repositories under '$target_dir' are clean.${NC}"
+  fi
+fi
