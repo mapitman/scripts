@@ -3,28 +3,31 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $(basename "$0") [-n] [-d <dir>] <org-or-user-path>"
+  echo "Usage: $(basename "$0") [-n] [-a] [-d <dir>] <org-or-user-path>"
   echo ""
   echo "Recursively clone all git repositories from a GitHub or GitLab user/organization."
   echo ""
   echo "Options:"
   echo "  -d <dir>  Base directory to clone repositories into (default: .)"
+  echo "  -a        Clone archived repositories as well (by default, they are skipped)"
   echo "  -n        Dry-run: show what would be cloned without making changes"
   echo "  -h        Show this help message and exit"
   echo ""
   echo "Examples:"
   echo "  $(basename "$0") github.com/mapitman"
-  echo "  $(basename "$0") gitlab.com/gitlab-org"
+  echo "  $(basename "$0") -a gitlab.com/gitlab-org"
   echo "  $(basename "$0") -d ~/src github.com/mapitman"
   echo "  $(basename "$0") -n https://github.com/mapitman"
 }
 
 base_dir="."
 dry_run=false
+clone_archived=false
 
-while getopts ":nd:h" opt; do
+while getopts ":nad:h" opt; do
   case $opt in
     n) dry_run=true ;;
+    a) clone_archived=true ;;
     d) base_dir="$OPTARG" ;;
     h) usage; exit 0 ;;
     \?) echo "Unknown option: -$OPTARG" >&2; usage >&2; exit 1 ;;
@@ -71,7 +74,11 @@ fetch_github_repos() {
   if command -v gh >/dev/null 2>&1; then
     echo "Attempting to list repositories using 'gh' CLI..." >&2
     local gh_output
-    if gh_output=$(gh repo list "$path" --limit 10000 --json sshUrl,url,nameWithOwner --jq '.[] | "\(.sshUrl)\t\(.url)\t\(.nameWithOwner)"' 2>/dev/null); then
+    local jq_filter='.[]'
+    if ! $clone_archived; then
+      jq_filter='.[] | select(.isArchived | not)'
+    fi
+    if gh_output=$(gh repo list "$path" --limit 10000 --json sshUrl,url,nameWithOwner,isArchived --jq "$jq_filter | \"\(.sshUrl)\t\(.url)\t\(.nameWithOwner)\"" 2>/dev/null); then
       if [[ -n "$gh_output" ]]; then
         echo "$gh_output" >> "$temp_repos"
         echo "Successfully retrieved repositories using 'gh' CLI." >&2
@@ -145,7 +152,11 @@ fetch_github_repos() {
     fi
 
     # Extract SSH url, HTTPS url, and full path
-    jq -r '.[] | "\(.ssh_url)\t\(.clone_url)\t\(.full_name)"' "$page_file" >> "$temp_repos"
+    if $clone_archived; then
+      jq -r '.[] | "\(.ssh_url)\t\(.clone_url)\t\(.full_name)"' "$page_file" >> "$temp_repos"
+    else
+      jq -r '.[] | select(.archived | not) | "\(.ssh_url)\t\(.clone_url)\t\(.full_name)"' "$page_file" >> "$temp_repos"
+    fi
     
     rm -f "$page_file"
 
@@ -165,7 +176,11 @@ fetch_gitlab_repos() {
   if command -v glab >/dev/null 2>&1; then
     echo "Attempting to list repositories using 'glab' CLI..." >&2
     local glab_output
-    if glab_output=$(glab api "groups/$encoded_path/projects?include_subgroups=true&per_page=100" --all 2>/dev/null); then
+    local archived_filter=""
+    if ! $clone_archived; then
+      archived_filter="&archived=false"
+    fi
+    if glab_output=$(glab api "groups/$encoded_path/projects?include_subgroups=true${archived_filter}&per_page=100" --all 2>/dev/null); then
       if [[ -n "$glab_output" && $(echo "$glab_output" | jq '. | length' 2>/dev/null) -gt 0 ]]; then
         echo "$glab_output" | jq -r '.[] | "\(.ssh_url_to_repo)\t\(.http_url_to_repo)\t\(.path_with_namespace)"' >> "$temp_repos"
         echo "Successfully retrieved group repositories using 'glab' CLI." >&2
@@ -173,7 +188,7 @@ fetch_gitlab_repos() {
       fi
     fi
     
-    if glab_output=$(glab api "users/$path/projects?per_page=100" --all 2>/dev/null); then
+    if glab_output=$(glab api "users/$path/projects?per_page=100${archived_filter}" --all 2>/dev/null); then
       if [[ -n "$glab_output" && $(echo "$glab_output" | jq '. | length' 2>/dev/null) -gt 0 ]]; then
         echo "$glab_output" | jq -r '.[] | "\(.ssh_url_to_repo)\t\(.http_url_to_repo)\t\(.path_with_namespace)"' >> "$temp_repos"
         echo "Successfully retrieved user repositories using 'glab' CLI." >&2
@@ -243,8 +258,14 @@ fetch_gitlab_repos() {
     local query_url
     if $is_group; then
       query_url="$api_url?include_subgroups=true&per_page=100&page=$page"
+      if ! $clone_archived; then
+        query_url="${query_url}&archived=false"
+      fi
     else
       query_url="$api_url?per_page=100&page=$page"
+      if ! $clone_archived; then
+        query_url="${query_url}&archived=false"
+      fi
     fi
 
     page_http_code=$(curl -s "${auth_header[@]}" -w "%{http_code}" -o "$page_file" "$query_url")

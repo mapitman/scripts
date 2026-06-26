@@ -12,7 +12,7 @@ git-clone-all - recursively clone all git repositories from a GitHub or GitLab u
 
 # SYNOPSIS
 
-**git-clone-all** [-n] [-d *dir*] [-h] *org-or-user-path*
+**git-clone-all** [-n] [-a] [-d *dir*] [-h] *org-or-user-path*
 
 # DESCRIPTION
 
@@ -41,6 +41,10 @@ The script automatically prioritizes using CLI utilities if they are installed a
 **-d** *dir*
 
 : Specify the base directory where repositories should be cloned. Defaults to the current directory (`.`).
+
+**-a**
+
+: Clone archived repositories as well. By default, archived repositories are skipped.
 
 **-n**
 
