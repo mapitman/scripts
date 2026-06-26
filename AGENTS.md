@@ -23,8 +23,8 @@ Shell utility scripts installed to `~/.local/bin` so they're on `$PATH` from any
 
 ## Install And Man Pages
 
-- **Makefile is the source of truth** — every installed script must be listed in `SCRIPTS` in the `Makefile`
-- **Install and uninstall stay in sync** — `make install` and `make uninstall` should handle both scripts and their man pages together
+- **justfile is the source of truth** — every installed script must be listed in `scripts` in the `justfile`
+- **Install and uninstall stay in sync** — `just install` and `just uninstall` should handle both scripts and their man pages together
 - **Man source naming** — each installed command should have a matching manpage source named `man/<command>.1.md`
 - **Generated manpages are build artifacts** — the Markdown sources under `man/` are the canonical source, and `pandoc` generates the `man(1)` files
 - **User-local install paths** — scripts install to `~/.local/bin`; man pages install under `${XDG_DATA_HOME:-$HOME/.local/share}/man/man1`
@@ -32,7 +32,7 @@ Shell utility scripts installed to `~/.local/bin` so they're on `$PATH` from any
 ## Naming
 
 - **Prefer short command names** — choose concise, extensionless names intended for direct use from `$PATH`
-- **Renames must be propagated** — if a script is renamed, update the script path, `Makefile`, manpage source name/title, and any local tooling references
+- **Renames must be propagated** — if a script is renamed, update the script path, `justfile`, manpage source name/title, and any local tooling references
 
 ## Interactive UX
 
