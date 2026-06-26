@@ -5,8 +5,8 @@ mandir := env_var_or_default("MANDIR", xdg_data_home / "man")
 man1dir := env_var_or_default("MAN1DIR", mandir / "man1")
 pandoc := env_var_or_default("PANDOC", "pandoc")
 
-scripts := "general/mktlapse general/nmapscan general/selfcert general/strip-ext qemu/vmctl"
-man_sources := "man/mktlapse.1.md man/nmapscan.1.md man/selfcert.1.md man/strip-ext.1.md man/vmctl.1.md"
+scripts := "development/git-clone-all general/mktlapse general/nmapscan general/selfcert general/strip-ext qemu/vmctl"
+man_sources := "man/git-clone-all.1.md man/mktlapse.1.md man/nmapscan.1.md man/selfcert.1.md man/strip-ext.1.md man/vmctl.1.md"
 
 # Default action: install scripts and man pages
 default: install
